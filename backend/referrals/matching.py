@@ -59,11 +59,19 @@ def score_agent(agent, referral):
 
 
 def build_offers(referral):
-    """Rank agents for a referral and create offers for the top candidates."""
+    """Rank eligible agents for a referral and create offers for the top candidates."""
+    if referral.status in {Referral.Status.ASSIGNED, Referral.Status.CLOSED}:
+        return []
+
     now = timezone.now()
+    offered_agent_ids = set(
+        Offer.objects.filter(referral=referral).values_list("agent_id", flat=True)
+    )
     candidates = []
-    for agent in Agent.objects.filter(active=True):
+    for agent in Agent.objects.filter(active=True).exclude(pk__in=offered_agent_ids):
         score, explanation, snapshot = score_agent(agent, referral)
+        if not snapshot["eligible"]:
+            continue
         candidates.append((score, agent, explanation, snapshot))
 
     candidates.sort(key=lambda item: item[0], reverse=True)

@@ -45,6 +45,9 @@ def my_offers(request):
             actor="system",
             payload={"offer_id": offer.id},
         )
+        from .matching import build_offers
+
+        build_offers(offer.referral)
 
     offers = (
         Offer.objects.filter(agent=agent, status=Offer.Status.PENDING)
@@ -97,7 +100,12 @@ def decline_offer(request, offer_id):
 @api_view(["GET"])
 @permission_classes([IsOpsUser])
 def ops_referrals(request):
-    referrals = Referral.objects.all().order_by("-created_at")
+    referrals = (
+        Referral.objects.select_related("assigned_agent")
+        .prefetch_related("offers__agent", "events")
+        .all()
+        .order_by("-created_at")
+    )
     return Response(OpsReferralSerializer(referrals, many=True).data)
 
 

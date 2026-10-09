@@ -89,26 +89,25 @@ class OpsReferralSerializer(serializers.ModelSerializer):
     def get_assigned_agent(self, obj):
         if obj.assigned_agent_id is None:
             return None
-        agent = Agent.objects.get(pk=obj.assigned_agent_id)
+        agent = obj.assigned_agent
         return {"id": agent.id, "name": agent.name, "email": agent.email}
 
     def get_offers(self, obj):
-        results = []
-        for offer in obj.offers.all().order_by("-offered_at"):
-            results.append(
-                {
-                    "id": offer.id,
-                    "agent": offer.agent.name,
-                    "score": offer.score,
-                    "status": offer.status,
-                    "offered_at": offer.offered_at,
-                    "expires_at": offer.expires_at,
-                }
-            )
-        return results
+        offers = list(obj.offers.all().order_by("-offered_at"))
+        return [
+            {
+                "id": offer.id,
+                "agent": offer.agent.name,
+                "score": offer.score,
+                "status": offer.status,
+                "offered_at": offer.offered_at,
+                "expires_at": offer.expires_at,
+            }
+            for offer in offers
+        ]
 
     def get_events(self, obj):
-        return ReferralEventSerializer(obj.events.all(), many=True).data
+        return ReferralEventSerializer(list(obj.events.all()), many=True).data
 
     def get_age_minutes(self, obj):
         from django.utils import timezone
