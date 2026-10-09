@@ -13,8 +13,25 @@ from .models import Referral, ReferralEvent
 
 logger = logging.getLogger("referrals.webhooks")
 
-# Events we have already processed, so upstream retries do not create duplicates.
+# Short-lived in-memory cache for duplicate checks during a process lifetime.
+# We still persist duplicate checks in the database so a retry is deduped after
+# process restarts as well.
 _PROCESSED_EVENT_IDS: set[str] = set()
+
+
+def _is_duplicate_delivery(event_id: str, external_id: str) -> bool:
+    if event_id in _PROCESSED_EVENT_IDS:
+        return True
+    if ReferralEvent.objects.filter(
+        event_type=ReferralEvent.Type.REFERRAL_RECEIVED,
+        payload__event_id=event_id,
+    ).exists():
+        _PROCESSED_EVENT_IDS.add(event_id)
+        return True
+    if Referral.objects.filter(external_id=external_id).exists():
+        _PROCESSED_EVENT_IDS.add(event_id)
+        return True
+    return False
 
 REQUIRED_FIELDS = [
     "event_id",
@@ -44,9 +61,10 @@ def intake_referral(request):
         )
 
     event_id = str(payload["event_id"])
-    if event_id in _PROCESSED_EVENT_IDS:
-        logger.info("duplicate delivery ignored: event_id=%s", event_id)
-        return Response({"status": "duplicate_ignored", "event_id": event_id})
+    external_id = str(payload["external_id"])
+    if _is_duplicate_delivery(event_id, external_id):
+        logger.info("duplicate delivery ignored: event_id=%s external_id=%s", event_id, external_id)
+        return Response({"status": "duplicate_ignored", "event_id": event_id, "external_id": external_id})
 
     referral = Referral.objects.create(
         external_id=payload["external_id"],

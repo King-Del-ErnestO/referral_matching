@@ -3,6 +3,7 @@ from datetime import timedelta
 import pytest
 from django.utils import timezone
 
+from referrals import notifications
 from referrals.models import Claim, Offer, Referral, ReferralEvent
 
 pytestmark = pytest.mark.django_db
@@ -62,6 +63,47 @@ def test_agent_can_decline_offer(pending_offer, client_for):
     assert pending_offer.status == Offer.Status.DECLINED
     assert pending_offer.referral.events.filter(
         event_type=ReferralEvent.Type.OFFER_DECLINED
+    ).exists()
+
+
+def test_declining_offer_requeues_referral_for_next_candidate(make_agent, make_referral, client_for):
+    agent_a = make_agent("agent.a", active_referral_count=0)
+    agent_b = make_agent("agent.b", active_referral_count=0)
+    referral = make_referral()
+    offer = Offer.objects.create(
+        referral=referral,
+        agent=agent_a,
+        score=0.9,
+        eligibility_snapshot={"eligible": True, "reasons": []},
+        expires_at=timezone.now() + timedelta(minutes=10),
+    )
+
+    response = client_for(agent_a.user).post(f"/api/offers/{offer.id}/decline/")
+    assert response.status_code == 200
+    assert Offer.objects.filter(referral=referral).count() >= 2
+    assert referral.events.filter(event_type=ReferralEvent.Type.OFFER_SENT).count() >= 2
+
+
+def test_claim_notification_error_rolls_back_assignment_and_records_conflict(
+    pending_offer, client_for, monkeypatch
+):
+    def boom(claim):
+        raise notifications.NotificationError("bad gateway")
+
+    monkeypatch.setattr("referrals.notifications.send_claim_confirmation", boom)
+
+    client = client_for(pending_offer.agent.user)
+    response = client.post(f"/api/offers/{pending_offer.id}/claim/")
+    assert response.status_code == 400
+    assert response.data["code"] == "notification_failed"
+
+    pending_offer.refresh_from_db()
+    pending_offer.referral.refresh_from_db()
+    assert pending_offer.status == Offer.Status.PENDING
+    assert pending_offer.referral.status == Referral.Status.NEW
+    assert not Claim.objects.filter(referral=pending_offer.referral, agent=pending_offer.agent, active=True).exists()
+    assert pending_offer.referral.events.filter(
+        event_type=ReferralEvent.Type.CLAIM_CONFLICTED
     ).exists()
 
 

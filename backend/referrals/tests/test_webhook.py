@@ -1,6 +1,7 @@
 import pytest
 from rest_framework.test import APIClient
 
+from referrals import webhooks
 from referrals.models import Offer, Referral, ReferralEvent
 
 pytestmark = pytest.mark.django_db
@@ -51,3 +52,18 @@ def test_webhook_creates_referral_and_offers(make_agent):
     event_types = set(referral.events.values_list("event_type", flat=True))
     assert ReferralEvent.Type.REFERRAL_RECEIVED in event_types
     assert ReferralEvent.Type.OFFER_SENT in event_types
+
+
+def test_webhook_deduplicates_persisted_event_id(make_agent):
+    make_agent("agent.one", performance_score=0.9)
+    make_agent("agent.two", performance_score=0.6)
+
+    first = post_webhook(dict(PAYLOAD, event_id="evt-duplicate-1"))
+    assert first.status_code == 201
+
+    webhooks._PROCESSED_EVENT_IDS.clear()
+
+    second = post_webhook(dict(PAYLOAD, event_id="evt-duplicate-1"))
+    assert second.status_code == 200
+    assert second.data["status"] == "duplicate_ignored"
+    assert Referral.objects.filter(external_id="lead-90001").count() == 1

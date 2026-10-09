@@ -1,10 +1,11 @@
 """Claim handling: an agent accepts an offer and takes ownership of the referral."""
 
+from django.db import transaction
 from django.utils import timezone
 
 from . import notifications
 from .events import record_event
-from .models import Claim, Offer, Referral, ReferralEvent
+from .models import Agent, Claim, Offer, Referral, ReferralEvent
 
 
 class ClaimError(Exception):
@@ -15,7 +16,9 @@ class ClaimError(Exception):
 
 def claim_offer(offer, agent):
     """Accept an offer on behalf of the agent and assign the referral."""
-    referral = offer.referral
+    referral = Referral.objects.select_for_update().get(pk=offer.referral_id)
+    offer = Offer.objects.select_for_update().get(pk=offer.pk)
+    agent = Agent.objects.select_for_update().get(pk=agent.pk)
 
     record_event(
         referral,
@@ -33,20 +36,42 @@ def claim_offer(offer, agent):
     if Claim.objects.filter(referral=referral, active=True).exists():
         raise ClaimError("This referral has already been claimed.", code="already_claimed")
 
-    claim = Claim.objects.create(referral=referral, agent=agent)
+    try:
+        with transaction.atomic():
+            referral = Referral.objects.select_for_update().get(pk=referral.pk)
+            offer = Offer.objects.select_for_update().get(pk=offer.pk)
+            agent = Agent.objects.select_for_update().get(pk=agent.pk)
 
-    referral.status = Referral.Status.ASSIGNED
-    referral.assigned_agent = agent
-    referral.save(update_fields=["status", "assigned_agent"])
+            if offer.status != Offer.Status.PENDING:
+                raise ClaimError("This offer is no longer open.", code="offer_not_open")
+            if offer.expires_at < timezone.now():
+                raise ClaimError("This offer has expired.", code="offer_expired")
+            if referral.status == Referral.Status.ASSIGNED:
+                raise ClaimError("This referral has already been claimed.", code="already_claimed")
+            if Claim.objects.filter(referral=referral, active=True).exists():
+                raise ClaimError("This referral has already been claimed.", code="already_claimed")
 
-    offer.status = Offer.Status.ACCEPTED
-    offer.responded_at = timezone.now()
-    offer.save(update_fields=["status", "responded_at"])
+            claim = Claim.objects.create(referral=referral, agent=agent)
+            referral.status = Referral.Status.ASSIGNED
+            referral.assigned_agent = agent
+            referral.save(update_fields=["status", "assigned_agent"])
 
-    agent.active_referral_count += 1
-    agent.save(update_fields=["active_referral_count"])
+            offer.status = Offer.Status.ACCEPTED
+            offer.responded_at = timezone.now()
+            offer.save(update_fields=["status", "responded_at"])
 
-    notifications.send_claim_confirmation(claim)
+            agent.active_referral_count += 1
+            agent.save(update_fields=["active_referral_count"])
+
+            notifications.send_claim_confirmation(claim)
+    except notifications.NotificationError as exc:
+        record_event(
+            referral,
+            ReferralEvent.Type.CLAIM_CONFLICTED,
+            actor=agent.name,
+            payload={"offer_id": offer.id, "error": str(exc), "reason": "notification_failed"},
+        )
+        raise ClaimError(f"The claim could not be completed: {exc}", code="notification_failed") from exc
 
     record_event(
         referral,
@@ -59,7 +84,7 @@ def claim_offer(offer, agent):
 
 
 def decline_offer(offer, agent):
-    """Record that the agent passed on the offer."""
+    """Record that the agent passed on the offer and continue the queue."""
     if offer.status != Offer.Status.PENDING:
         raise ClaimError("This offer is no longer open.", code="offer_not_open")
 
@@ -73,4 +98,8 @@ def decline_offer(offer, agent):
         actor=agent.name,
         payload={"offer_id": offer.id},
     )
+
+    from .matching import build_offers
+
+    build_offers(offer.referral)
     return offer
